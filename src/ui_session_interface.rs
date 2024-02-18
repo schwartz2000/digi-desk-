@@ -437,8 +437,13 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn alternative_codecs(&self) -> (bool, bool, bool, bool) {
         let luid = self.lc.read().unwrap().adapter_luid;
-        let decoder =
-            scrap::codec::Decoder::supported_decodings(None, cfg!(feature = "flutter"), luid);
+        let mark_unsupported = self.lc.read().unwrap().mark_unsupported.clone();
+        let decoder = scrap::codec::Decoder::supported_decodings(
+            None,
+            cfg!(feature = "flutter"),
+            luid,
+            &mark_unsupported,
+        );
         let mut vp8 = decoder.ability_vp8 > 0;
         let mut av1 = decoder.ability_av1 > 0;
         let mut h264 = decoder.ability_h264 > 0;
@@ -718,6 +723,11 @@ impl<T: InvokeUiSession> Session<T> {
         let mut msg_out = Message::new();
         msg_out.set_misc(misc);
         self.send(Data::Message(msg_out));
+
+        #[cfg(not(feature = "flutter"))]
+        {
+            self.capture_displays(vec![], vec![], vec![display]);
+        }
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1082,6 +1092,15 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Login((os_username, os_password, password, remember)));
     }
 
+    pub fn send2fa(&self, code: String) {
+        let mut msg_out = Message::new();
+        msg_out.set_auth_2fa(Auth2FA {
+            code,
+            ..Default::default()
+        });
+        self.send(Data::Message(msg_out));
+    }
+
     pub fn new_rdp(&self) {
         self.send(Data::NewRDP);
     }
@@ -1232,6 +1251,19 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn close_voice_call(&self) {
         self.send(Data::CloseVoiceCall);
     }
+
+    pub fn send_selected_session_id(&self, sid: String) {
+        if let Ok(sid) = sid.parse::<u32>() {
+            self.lc.write().unwrap().selected_windows_session_id = Some(sid);
+            let mut misc = Misc::new();
+            misc.set_selected_sid(sid);
+            let mut msg = Message::new();
+            msg.set_misc(misc);
+            self.send(Data::Message(msg));
+        } else {
+            log::error!("selected invalid sid: {}", sid);
+        }
+    }
 }
 
 pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
@@ -1291,6 +1323,7 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn next_rgba(&self, display: usize);
     #[cfg(all(feature = "gpucodec", feature = "flutter"))]
     fn on_texture(&self, display: usize, texture: *mut c_void);
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>);
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {
@@ -1330,6 +1363,10 @@ impl<T: InvokeUiSession> Interface for Session<T> {
 
     fn handle_login_error(&self, err: &str) -> bool {
         handle_login_error(self.lc.clone(), err, self)
+    }
+
+    fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>) {
+        self.ui_handler.set_multiple_windows_session(sessions);
     }
 
     fn handle_peer_info(&self, mut pi: PeerInfo) {
@@ -1390,6 +1427,19 @@ impl<T: InvokeUiSession> Interface for Session<T> {
             std::fs::File::create(&path).ok();
             if let Some(path) = path.to_str() {
                 crate::platform::windows::add_recent_document(&path);
+            }
+        }
+        if !pi.windows_sessions.sessions.is_empty() {
+            let selected = self
+                .lc
+                .read()
+                .unwrap()
+                .selected_windows_session_id
+                .to_owned();
+            if selected == Some(pi.windows_sessions.current_sid) {
+                self.send_selected_session_id(pi.windows_sessions.current_sid.to_string());
+            } else {
+                self.set_multiple_windows_session(pi.windows_sessions.sessions.clone());
             }
         }
     }
